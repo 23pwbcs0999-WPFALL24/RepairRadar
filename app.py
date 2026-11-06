@@ -13,7 +13,8 @@ import streamlit as st
 # -----------------------------------------------------------------------------
 BASE_DIR = Path(__file__).resolve().parent
 ARTIFACT_DIR = BASE_DIR / "artifacts"
-DATA_PATH = ARTIFACT_DIR / "dataset_for_app.csv"
+MODEL_DIR = BASE_DIR / "models"
+DATASET_DIR = BASE_DIR / "dataset"
 HERO_PATH = BASE_DIR / "repairradar_machine_banner.jpg"
 BEARING_PATH = BASE_DIR / "repairradar_bearing_detail.jpg"
 
@@ -314,16 +315,63 @@ div[data-testid="stRadio"] [role="radiogroup"] label:has(input:checked) span {
 
 @st.cache_resource
 def load_assets():
-    failure = joblib.load(ARTIFACT_DIR / "failure_model.joblib")
-    fault = joblib.load(ARTIFACT_DIR / "fault_model.joblib")
-    with open(ARTIFACT_DIR / "metadata.json", "r", encoding="utf-8") as file:
-        meta = json.load(file)
+    failure_path = next(
+        (
+            path
+            for path in (
+                ARTIFACT_DIR / "failure_model.joblib",
+                MODEL_DIR / "failure_model.joblib",
+            )
+            if path.exists()
+        ),
+        None,
+    )
+    fault_path = next(
+        (
+            path
+            for path in (
+                ARTIFACT_DIR / "fault_model.joblib",
+                MODEL_DIR / "fault_model.joblib",
+            )
+            if path.exists()
+        ),
+        None,
+    )
+    if failure_path is None or fault_path is None:
+        raise FileNotFoundError(
+            "Saved models were not found in artifacts/ or models/. "
+            "Run the notebook's model-training and save section first."
+        )
+
+    failure = joblib.load(failure_path)
+    fault = joblib.load(fault_path)
+    metadata_path = ARTIFACT_DIR / "metadata.json"
+    if metadata_path.exists():
+        with open(metadata_path, "r", encoding="utf-8") as file:
+            meta = json.load(file)
+    else:
+        meta = {}
     return failure, fault, meta
 
 
 @st.cache_data
 def load_data():
-    return pd.read_csv(DATA_PATH)
+    data_path = next(
+        (
+            path
+            for path in (
+                ARTIFACT_DIR / "dataset_for_app.csv",
+                DATASET_DIR / "repairradar_synthetic.csv",
+            )
+            if path.exists()
+        ),
+        None,
+    )
+    if data_path is None:
+        raise FileNotFoundError(
+            "The application dataset was not found in artifacts/ or dataset/."
+        )
+    return pd.read_csv(data_path)
 
 
 def model_classes(model):
@@ -381,7 +429,19 @@ except Exception as error:
     st.exception(error)
     st.stop()
 
-features = metadata["features"]
+features = metadata.get(
+    "features",
+    [
+        column
+        for column in df.columns
+        if column not in {
+            "machine_id",
+            "timestamp",
+            "failure_within_7_days",
+            "fault_type",
+        }
+    ],
+)
 
 # -----------------------------------------------------------------------------
 # Main top navigation — sidebar is intentionally not used.
@@ -688,44 +748,51 @@ elif page == "Model results":
         unsafe_allow_html=True,
     )
     task_choice = st.selectbox("Prediction task", ["Failure within 7 days", "Fault type"])
-    result = metadata["failure_result"] if task_choice == "Failure within 7 days" else metadata["fault_result"]
-    metrics = result["test_metrics"]
-    st.markdown(f"**Selected algorithm:** {result['best_model']} &nbsp; · &nbsp; **Test set:** unseen machines")
+    result_key = "failure_result" if task_choice == "Failure within 7 days" else "fault_result"
+    result = metadata.get(result_key)
+    if result is None:
+        st.info(
+            "Training metrics are not available because metadata.json was not bundled "
+            "with these saved models. Predictions remain available."
+        )
+    else:
+        metrics = result["test_metrics"]
+        st.markdown(f"**Selected algorithm:** {result['best_model']} &nbsp; · &nbsp; **Test set:** unseen machines")
 
-    metric_cols = st.columns(4)
-    metric_labels = [
-        ("Accuracy", "accuracy"),
-        ("Precision", "precision_weighted"),
-        ("Recall", "recall_weighted"),
-        ("F1 score", "f1_weighted"),
-    ]
-    for col, (label, key) in zip(metric_cols, metric_labels):
-        with col:
-            card(label, f"{metrics[key]:.1%}", "Held-out test performance")
+        metric_cols = st.columns(4)
+        metric_labels = [
+            ("Accuracy", "accuracy"),
+            ("Precision", "precision_weighted"),
+            ("Recall", "recall_weighted"),
+            ("F1 score", "f1_weighted"),
+        ]
+        for col, (label, key) in zip(metric_cols, metric_labels):
+            with col:
+                card(label, f"{metrics[key]:.1%}", "Held-out test performance")
 
-    st.markdown("<br>", unsafe_allow_html=True)
-    comparison = pd.DataFrame(result["validation_comparison"])
-    st.markdown("#### Validation model comparison")
-    st.dataframe(
-        comparison.style.format({
-            "accuracy": "{:.3f}", "precision_weighted": "{:.3f}",
-            "recall_weighted": "{:.3f}", "f1_weighted": "{:.3f}", "f1_macro": "{:.3f}",
-        }),
-        use_container_width=True, hide_index=True,
-    )
+        st.markdown("<br>", unsafe_allow_html=True)
+        comparison = pd.DataFrame(result["validation_comparison"])
+        st.markdown("#### Validation model comparison")
+        st.dataframe(
+            comparison.style.format({
+                "accuracy": "{:.3f}", "precision_weighted": "{:.3f}",
+                "recall_weighted": "{:.3f}", "f1_weighted": "{:.3f}", "f1_macro": "{:.3f}",
+            }),
+            use_container_width=True, hide_index=True,
+        )
 
-    cm = np.array(result["confusion_matrix"])
-    class_labels = result["classes"]
-    fig = go.Figure(data=go.Heatmap(
-        z=cm, x=class_labels, y=class_labels,
-        colorscale=[[0, WARM_CREAM], [.5, "#B9C8B7"], [1, SAGE]],
-        text=cm, texttemplate="%{text}",
-        textfont=dict(color=DARK_GREEN),
-        colorbar=dict(tickfont=dict(color=DARK_GREEN)),
-    ))
-    fig.update_layout(title="Test-set confusion matrix", xaxis_title="Predicted", yaxis_title="Actual")
-    st.plotly_chart(style_figure(fig, 430), use_container_width=True, theme=None)
-    st.caption("Validation results select the model. The displayed metrics and confusion matrix use the held-out test set.")
+        cm = np.array(result["confusion_matrix"])
+        class_labels = result["classes"]
+        fig = go.Figure(data=go.Heatmap(
+            z=cm, x=class_labels, y=class_labels,
+            colorscale=[[0, WARM_CREAM], [.5, "#B9C8B7"], [1, SAGE]],
+            text=cm, texttemplate="%{text}",
+            textfont=dict(color=DARK_GREEN),
+            colorbar=dict(tickfont=dict(color=DARK_GREEN)),
+        ))
+        fig.update_layout(title="Test-set confusion matrix", xaxis_title="Predicted", yaxis_title="Actual")
+        st.plotly_chart(style_figure(fig, 430), use_container_width=True, theme=None)
+        st.caption("Validation results select the model. The displayed metrics and confusion matrix use the held-out test set.")
 
 # -----------------------------------------------------------------------------
 # ABOUT
